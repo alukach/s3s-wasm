@@ -15,6 +15,28 @@ use futures::future::BoxFuture;
 use hyper::service::Service;
 use tracing::{debug, error};
 
+mod time {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn now() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn now() -> () {
+        ()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn elapsed(start: std::time::Instant) -> std::time::Duration {
+        start.elapsed()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn elapsed(_: ()) -> () {
+        ()
+    }
+}
+
 pub struct S3ServiceBuilder {
     s3: Arc<dyn S3>,
     host: Option<Box<dyn S3Host>>,
@@ -75,12 +97,12 @@ impl S3Service {
     #[tracing::instrument(
         level = "debug",
         skip(self, req),
-        fields(start_time=?time::OffsetDateTime::now_utc())
+        fields(start_time=?time::now())
     )]
     pub async fn call(&self, req: hyper::Request<Body>) -> S3Result<hyper::Response<Body>> {
         debug!(?req);
 
-        let t0 = std::time::Instant::now();
+        let t0 = time::now();
 
         let mut req = Request::from(req);
 
@@ -93,7 +115,7 @@ impl S3Service {
         };
         let result = crate::ops::call(&mut req, &ccx).await.map(Into::into);
 
-        let duration = t0.elapsed();
+        let duration = time::elapsed(t0);
 
         match result {
             Ok(ref res) => debug!(?duration, ?res),
