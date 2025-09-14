@@ -2,6 +2,7 @@ use super::Body;
 use super::Multipart;
 use super::OrderedQs;
 
+use crate::HttpRequest;
 use crate::auth::Credentials;
 use crate::path::S3Path;
 use crate::stream::VecByteStream;
@@ -13,6 +14,7 @@ use hyper::http::Extensions;
 use hyper::http::HeaderValue;
 
 pub struct Request {
+    pub version: http::Version,
     pub method: Method,
     pub uri: Uri,
     pub headers: HeaderMap<HeaderValue>,
@@ -34,10 +36,11 @@ pub(crate) struct S3Extensions {
     pub service: Option<String>,
 }
 
-impl From<hyper::Request<Body>> for Request {
-    fn from(req: hyper::Request<Body>) -> Self {
+impl From<HttpRequest> for Request {
+    fn from(req: HttpRequest) -> Self {
         let (parts, body) = req.into_parts();
         Self {
+            version: parts.version,
             method: parts.method,
             uri: parts.uri,
             headers: parts.headers,

@@ -12,7 +12,7 @@ pub fn is_sha256_checksum(s: &str) -> bool {
 
 /// `hmac_sha1(key, data)`
 pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
 
     let mut m = <Hmac<Sha1>>::new_from_slice(key.as_ref()).unwrap();
@@ -22,7 +22,7 @@ pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
 
 /// `hmac_sha256(key, data)`
 pub fn hmac_sha256(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     let mut m = <Hmac<Sha256>>::new_from_slice(key.as_ref()).unwrap();
@@ -59,7 +59,9 @@ fn sha256(data: &[u8]) -> impl AsRef<[u8]> {
 fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8; 32]> + use<> {
     use sha2::{Digest, Sha256};
     let mut h = <Sha256 as Digest>::new();
-    chunk.iter().for_each(|data| h.update(data));
+    for data in chunk {
+        h.update(data);
+    }
     h.finalize()
 }
 
@@ -67,7 +69,9 @@ fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8; 32]> + use<> {
 fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8]> {
     use openssl::hash::{Hasher, MessageDigest};
     let mut h = Hasher::new(MessageDigest::sha256()).unwrap();
-    chunk.iter().for_each(|data| h.update(data).unwrap());
+    for data in chunk {
+        h.update(data).unwrap();
+    }
     h.finish().unwrap()
 }
 

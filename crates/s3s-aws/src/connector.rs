@@ -1,7 +1,6 @@
 use crate::body::{s3s_body_into_sdk_body, sdk_body_into_s3s_body};
 
-use s3s::S3Result;
-use s3s::service::SharedS3Service;
+use s3s::service::S3Service;
 
 use std::ops::Not;
 
@@ -14,10 +13,9 @@ use aws_smithy_runtime_api::client::result::ConnectorError;
 
 use hyper::header::HOST;
 use hyper::http;
-use hyper::{Request, Response};
 
 #[derive(Debug)]
-pub struct Client(SharedS3Service);
+pub struct Client(S3Service);
 
 impl HttpClient for Client {
     fn http_connector(&self, _: &HttpConnectorSettings, _: &RuntimeComponents) -> SharedHttpConnector {
@@ -25,17 +23,17 @@ impl HttpClient for Client {
     }
 }
 
-impl From<SharedS3Service> for Client {
-    fn from(val: SharedS3Service) -> Self {
+impl From<S3Service> for Client {
+    fn from(val: S3Service) -> Self {
         Self(val)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Connector(SharedS3Service);
+pub struct Connector(S3Service);
 
-impl From<SharedS3Service> for Connector {
-    fn from(val: SharedS3Service) -> Self {
+impl From<S3Service> for Connector {
+    fn from(val: S3Service) -> Self {
         Self(val)
     }
 }
@@ -51,11 +49,11 @@ where
 impl HttpConnector for Connector {
     fn call(&self, req: AwsHttpRequest) -> HttpConnectorFuture {
         let service = self.0.clone();
-        HttpConnectorFuture::new_boxed(Box::pin(async move { convert_output(service.as_ref().call(convert_input(req)?).await) }))
+        HttpConnectorFuture::new_boxed(Box::pin(async move { convert_output(service.call(convert_input(req)?).await) }))
     }
 }
 
-fn convert_input(req: AwsHttpRequest) -> Result<Request<s3s::Body>, ConnectorError> {
+fn convert_input(req: AwsHttpRequest) -> Result<s3s::HttpRequest, ConnectorError> {
     let mut req = req.try_into_http1x().map_err(on_err)?;
 
     if req.headers().contains_key(HOST).not() {
@@ -66,10 +64,13 @@ fn convert_input(req: AwsHttpRequest) -> Result<Request<s3s::Body>, ConnectorErr
     Ok(req.map(sdk_body_into_s3s_body))
 }
 
-fn convert_output(result: S3Result<Response<s3s::Body>>) -> Result<AwsHttpResponse, ConnectorError> {
+fn convert_output(result: Result<s3s::HttpResponse, s3s::HttpError>) -> Result<AwsHttpResponse, ConnectorError> {
     match result {
         Ok(res) => res.map(s3s_body_into_sdk_body).try_into().map_err(on_err),
-        Err(e) => Err(on_err(e)),
+        Err(e) => {
+            let kind = aws_smithy_runtime_api::client::retries::ErrorKind::ServerError;
+            Err(ConnectorError::other(e.into(), Some(kind)))
+        }
     }
 }
 

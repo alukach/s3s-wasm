@@ -208,6 +208,11 @@ pub fn collect_rust_types(model: &smithy::Model, ops: &Operations) -> RustTypes 
                         http_query: field.traits.http_query().map(o),
                         xml_name: field.traits.xml_name().map(o),
                         xml_flattened: field.traits.xml_flattened(),
+
+                        is_xml_attr: field.traits.xml_attr(),
+                        xml_namespace_uri: field.traits.xml_namespace_uri().map(o),
+                        xml_namespace_prefix: field.traits.xml_namespace_prefix().map(o),
+
                         is_custom_extension: field.traits.minio(),
                     };
                     fields.push(field);
@@ -252,6 +257,18 @@ pub fn collect_rust_types(model: &smithy::Model, ops: &Operations) -> RustTypes 
 }
 
 fn patch_types(space: &mut RustTypes) {
+    // patch PartNumberMarker
+    // FIXME: https://github.com/awslabs/aws-sdk-rust/issues/1318
+    {
+        let Some(rust::Type::Alias(ty)) = space.get_mut("PartNumberMarker") else { panic!() };
+        assert_eq!(ty.type_, "String");
+        "i32".clone_into(&mut ty.type_);
+
+        let Some(rust::Type::Alias(ty)) = space.get_mut("NextPartNumberMarker") else { panic!() };
+        assert_eq!(ty.type_, "String");
+        "i32".clone_into(&mut ty.type_);
+    }
+
     // patch Tag
     {
         let Some(rust::Type::Struct(ty)) = space.get_mut("Tag") else { panic!() };
@@ -305,6 +322,9 @@ fn patch_types(space: &mut RustTypes) {
             http_query: None,
             xml_name: Some(request.name.clone()),
             xml_flattened: false,
+            is_xml_attr: false,
+            xml_namespace_uri: None,
+            xml_namespace_prefix: None,
             is_custom_extension: false,
         });
         ty.name = o("SelectObjectContentInput");
@@ -386,6 +406,8 @@ pub fn codegen(rust_types: &RustTypes, ops: &Operations) {
         "use std::str::FromStr;",
         "",
         "use stdx::default::default;",
+        "use serde::{Serialize, Deserialize};",
+        "",
     ]);
 
     for rust_type in rust_types.values() {
@@ -613,6 +635,11 @@ fn struct_derives(ty: &rust::Struct, rust_types: &RustTypes) -> Vec<&'static str
     }
     if can_derive_partial_eq(ty, rust_types) {
         derives.push("PartialEq");
+    }
+    // What to do with other types?
+    if ty.name == "Tagging" || ty.name == "Tag" {
+        derives.push("Serialize");
+        derives.push("Deserialize");
     }
     derives
 }

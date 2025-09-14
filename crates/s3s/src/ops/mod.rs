@@ -19,7 +19,7 @@ use crate::http::Body;
 use crate::http::{OrderedHeaders, OrderedQs};
 use crate::http::{Request, Response};
 use crate::path::{ParseS3PathError, S3Path};
-use crate::request::S3Request;
+use crate::protocol::S3Request;
 use crate::route::S3Route;
 use crate::s3_trait::S3;
 use crate::stream::VecByteStream;
@@ -64,10 +64,10 @@ fn build_s3_request<T>(input: T, req: &mut Request) -> S3Request<T> {
     let service = req.s3ext.service.take();
 
     S3Request {
+        input,
         method,
         uri,
         headers,
-        input,
         extensions,
         credentials,
         region,
@@ -218,9 +218,9 @@ pub async fn call(req: &mut Request, ccx: &CallContext<'_>) -> S3Result<Response
 
             match result {
                 Ok(s3_resp) => Ok(Response {
-                    status: s3_resp.output.0,
+                    status: s3_resp.status.unwrap_or_default(),
                     headers: s3_resp.headers,
-                    body: s3_resp.output.1,
+                    body: s3_resp.output,
                     extensions: s3_resp.extensions,
                 }),
                 Err(err) => {
@@ -238,6 +238,7 @@ enum Prepare {
 }
 
 #[allow(clippy::too_many_lines)]
+#[tracing::instrument(level = "debug", skip_all, err)]
 async fn prepare(req: &mut Request, ccx: &CallContext<'_>) -> S3Result<Prepare> {
     let s3_path;
     let mut content_length;
@@ -285,6 +286,7 @@ async fn prepare(req: &mut Request, ccx: &CallContext<'_>) -> S3Result<Prepare> 
             let mut scx = SignatureContext {
                 auth: ccx.auth,
 
+                req_version: req.version,
                 req_method: &req.method,
                 req_uri: &req.uri,
                 req_body: &mut req.body,

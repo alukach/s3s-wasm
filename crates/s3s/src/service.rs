@@ -1,18 +1,15 @@
 use crate::access::S3Access;
 use crate::auth::S3Auth;
-use crate::error::{S3Error, S3Result};
 use crate::host::S3Host;
 use crate::http::{Body, Request};
 use crate::route::S3Route;
 use crate::s3_trait::S3;
+use crate::{HttpError, HttpRequest, HttpResponse};
 
-use std::convert::Infallible;
 use std::fmt;
-use std::future::{Ready, ready};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use hyper::service::Service;
 use tracing::{debug, error};
 
 mod time {
@@ -76,16 +73,23 @@ impl S3ServiceBuilder {
     #[must_use]
     pub fn build(self) -> S3Service {
         S3Service {
-            s3: self.s3,
-            host: self.host,
-            auth: self.auth,
-            access: self.access,
-            route: self.route,
+            inner: Arc::new(Inner {
+                s3: self.s3,
+                host: self.host,
+                auth: self.auth,
+                access: self.access,
+                route: self.route,
+            }),
         }
     }
 }
 
+#[derive(Clone)]
 pub struct S3Service {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     s3: Arc<dyn S3>,
     host: Option<Box<dyn S3Host>>,
     auth: Option<Box<dyn S3Auth>>,
@@ -94,12 +98,13 @@ pub struct S3Service {
 }
 
 impl S3Service {
+    #[allow(clippy::missing_errors_doc)]
     #[tracing::instrument(
         level = "debug",
         skip(self, req),
         fields(start_time=?time::now())
     )]
-    pub async fn call(&self, req: hyper::Request<Body>) -> S3Result<hyper::Response<Body>> {
+    pub async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
         debug!(?req);
 
         let t0 = time::now();
@@ -107,30 +112,34 @@ impl S3Service {
         let mut req = Request::from(req);
 
         let ccx = crate::ops::CallContext {
-            s3: &self.s3,
-            host: self.host.as_deref(),
-            auth: self.auth.as_deref(),
-            access: self.access.as_deref(),
-            route: self.route.as_deref(),
+            s3: &self.inner.s3,
+            host: self.inner.host.as_deref(),
+            auth: self.inner.auth.as_deref(),
+            access: self.inner.access.as_deref(),
+            route: self.inner.route.as_deref(),
         };
-        let result = crate::ops::call(&mut req, &ccx).await.map(Into::into);
+        let result = match crate::ops::call(&mut req, &ccx).await {
+            Ok(resp) => Ok(HttpResponse::from(resp)),
+            Err(err) => Err(HttpError::new(Box::new(err))),
+        };
 
         let duration = time::elapsed(t0);
 
         match result {
-            Ok(ref res) => debug!(?duration, ?res),
+            Ok(ref resp) => {
+                if resp.status().is_server_error() {
+                    error!(?duration, ?resp);
+                } else {
+                    debug!(?duration, ?resp);
+                }
+            }
             Err(ref err) => error!(?duration, ?err),
         }
 
         result
     }
 
-    #[must_use]
-    pub fn into_shared(self) -> SharedS3Service {
-        SharedS3Service(Arc::new(self))
-    }
-
-    async fn call_shared(self: Arc<Self>, req: hyper::Request<Body>) -> S3Result<hyper::Response<Body>> {
+    async fn call_owned(self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
         self.call(req).await
     }
 }
@@ -141,43 +150,24 @@ impl fmt::Debug for S3Service {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SharedS3Service(Arc<S3Service>);
+impl hyper::service::Service<http::Request<hyper::body::Incoming>> for S3Service {
+    type Response = HttpResponse;
 
-impl SharedS3Service {
-    #[must_use]
-    pub fn into_make_service(self) -> MakeService<Self> {
-        MakeService(self)
-    }
-}
-
-impl AsRef<S3Service> for SharedS3Service {
-    fn as_ref(&self) -> &S3Service {
-        &self.0
-    }
-}
-
-// TODO(blocking): GAT?
-// See https://github.com/tower-rs/tower/issues/636
-impl Service<hyper::Request<hyper::body::Incoming>> for SharedS3Service {
-    type Response = hyper::Response<Body>;
-
-    type Error = S3Error;
+    type Error = HttpError;
 
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+    fn call(&self, req: http::Request<hyper::body::Incoming>) -> Self::Future {
         let req = req.map(Body::from);
-        let service = self.0.clone();
-        Box::pin(service.call_shared(req))
+        let service = self.clone();
+        Box::pin(service.call_owned(req))
     }
 }
 
-#[cfg(feature = "tower")]
-impl tower::Service<hyper::Request<hyper::body::Incoming>> for SharedS3Service {
-    type Response = hyper::Response<Body>;
+impl tower::Service<http::Request<hyper::body::Incoming>> for S3Service {
+    type Response = HttpResponse;
 
-    type Error = S3Error;
+    type Error = HttpError;
 
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -185,24 +175,54 @@ impl tower::Service<hyper::Request<hyper::body::Incoming>> for SharedS3Service {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+    fn call(&mut self, req: http::Request<hyper::body::Incoming>) -> Self::Future {
         let req = req.map(Body::from);
-        let service = self.0.clone();
-        Box::pin(service.call_shared(req))
+        let service = self.clone();
+        Box::pin(service.call_owned(req))
     }
 }
 
-#[derive(Clone)]
-pub struct MakeService<S>(S);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl<T, S: Clone> Service<T> for MakeService<S> {
-    type Response = S;
+    use crate::{S3Error, S3Request, S3Response};
 
-    type Error = Infallible;
+    use stdx::mem::output_size;
 
-    type Future = Ready<Result<Self::Response, Self::Error>>;
+    macro_rules! print_future_size {
+        ($func:path) => {
+            println!("{:<24}: {}", stringify!($func), output_size(&$func));
+        };
+    }
 
-    fn call(&self, _: T) -> Self::Future {
-        ready(Ok(self.0.clone()))
+    macro_rules! print_type_size {
+        ($ty:path) => {
+            println!("{:<24}: {}", stringify!($ty), std::mem::size_of::<$ty>());
+        };
+    }
+
+    #[test]
+    fn future_size() {
+        print_type_size!(std::time::Instant);
+
+        print_type_size!(HttpRequest);
+        print_type_size!(HttpResponse);
+        print_type_size!(HttpError);
+
+        print_type_size!(S3Request<()>);
+        print_type_size!(S3Response<()>);
+        print_type_size!(S3Error);
+
+        print_type_size!(S3Service);
+
+        print_future_size!(crate::ops::call);
+        print_future_size!(S3Service::call);
+        print_future_size!(S3Service::call_owned);
+
+        // In case the futures are made too large accidentally
+        assert!(output_size(&crate::ops::call) <= 1600);
+        assert!(output_size(&S3Service::call) <= 2900);
+        assert!(output_size(&S3Service::call_owned) <= 3200);
     }
 }

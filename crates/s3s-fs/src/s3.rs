@@ -4,6 +4,8 @@ use crate::utils::*;
 
 use s3s::S3;
 use s3s::S3Result;
+use s3s::crypto::Checksum;
+use s3s::crypto::Md5;
 use s3s::dto::*;
 use s3s::s3_error;
 use s3s::{S3Request, S3Response};
@@ -20,7 +22,6 @@ use tokio::io::AsyncSeekExt;
 use tokio_util::io::ReaderStream;
 
 use futures::TryStreamExt;
-use md5::{Digest, Md5};
 use numeric_cast::NumericCast;
 use stdx::default::default;
 use tracing::debug;
@@ -238,8 +239,10 @@ impl S3 for FileSystem {
 
         let info = self.load_internal_info(&input.bucket, &input.key).await?;
         let checksum = match &info {
-            Some(info) => crate::checksum::from_internal_info(info),
-            None => default(),
+            // S3 skips returning the checksum if a range is specified that is
+            // less than the whole file
+            Some(info) if content_length == file_len => crate::checksum::from_internal_info(info),
+            _ => default(),
         };
 
         let output = GetObjectOutput {
@@ -342,6 +345,7 @@ impl S3 for FileSystem {
 
         Ok(v2_resp.map_output(|v2| ListObjectsOutput {
             contents: v2.contents,
+            common_prefixes: v2.common_prefixes,
             delimiter: v2.delimiter,
             encoding_type: v2.encoding_type,
             name: v2.name,
@@ -360,46 +364,51 @@ impl S3 for FileSystem {
             return Err(s3_error!(NoSuchBucket));
         }
 
+        let delimiter = input.delimiter.as_deref();
+        let prefix = input.prefix.as_deref().unwrap_or("").trim_start_matches('/');
+
         let mut objects: Vec<Object> = default();
-        let mut dir_queue: VecDeque<PathBuf> = default();
-        dir_queue.push_back(path.clone());
+        let mut common_prefixes = std::collections::BTreeSet::new();
 
-        while let Some(dir) = dir_queue.pop_front() {
-            let mut iter = try_!(fs::read_dir(dir).await);
-            while let Some(entry) = try_!(iter.next_entry().await) {
-                let file_type = try_!(entry.file_type().await);
-                if file_type.is_dir() {
-                    dir_queue.push_back(entry.path());
-                } else {
-                    let file_path = entry.path();
-                    let key = try_!(file_path.strip_prefix(&path));
-                    let delimiter = input.delimiter.as_ref().map_or("/", |d| d.as_str());
-                    let Some(key_str) = normalize_path(key, delimiter) else {
-                        continue;
-                    };
+        if delimiter.is_some() {
+            // When delimiter is provided, only list immediate contents (non-recursive)
+            self.list_objects_with_delimiter(&path, prefix, delimiter.unwrap(), &mut objects, &mut common_prefixes)
+                .await?;
+        } else {
+            // When no delimiter, do recursive listing (current behavior)
+            let mut dir_queue: VecDeque<PathBuf> = default();
+            dir_queue.push_back(path.clone());
+            let prefix_is_empty = prefix.is_empty();
 
-                    if let Some(ref prefix) = input.prefix {
-                        let prefix_path: PathBuf = prefix.split(delimiter).collect();
+            while let Some(dir) = dir_queue.pop_front() {
+                let mut iter = try_!(fs::read_dir(dir).await);
+                while let Some(entry) = try_!(iter.next_entry().await) {
+                    let file_type = try_!(entry.file_type().await);
+                    if file_type.is_dir() {
+                        dir_queue.push_back(entry.path());
+                    } else {
+                        let file_path = entry.path();
+                        let key = try_!(file_path.strip_prefix(&path));
+                        let Some(key_str) = normalize_path(key, "/") else {
+                            continue;
+                        };
 
-                        let key_s = format!("{}", key.display());
-                        let prefix_path_s = format!("{}", prefix_path.display());
-
-                        if !key_s.starts_with(&prefix_path_s) {
+                        if !prefix_is_empty && !key_str.starts_with(prefix) {
                             continue;
                         }
+
+                        let metadata = try_!(entry.metadata().await);
+                        let last_modified = Timestamp::from(try_!(metadata.modified()));
+                        let size = metadata.len();
+
+                        let object = Object {
+                            key: Some(key_str),
+                            last_modified: Some(last_modified),
+                            size: Some(try_!(i64::try_from(size))),
+                            ..Default::default()
+                        };
+                        objects.push(object);
                     }
-
-                    let metadata = try_!(entry.metadata().await);
-                    let last_modified = Timestamp::from(try_!(metadata.modified()));
-                    let size = metadata.len();
-
-                    let object = Object {
-                        key: Some(key_str),
-                        last_modified: Some(last_modified),
-                        size: Some(try_!(i64::try_from(size))),
-                        ..Default::default()
-                    };
-                    objects.push(object);
                 }
             }
         }
@@ -419,12 +428,24 @@ impl S3 for FileSystem {
             objects
         };
 
+        let common_prefixes_list = if common_prefixes.is_empty() {
+            None
+        } else {
+            Some(
+                common_prefixes
+                    .into_iter()
+                    .map(|prefix| CommonPrefix { prefix: Some(prefix) })
+                    .collect(),
+            )
+        };
+
         let key_count = try_!(i32::try_from(objects.len()));
 
         let output = ListObjectsV2Output {
             key_count: Some(key_count),
             max_keys: Some(key_count),
             contents: Some(objects),
+            common_prefixes: common_prefixes_list,
             delimiter: input.delimiter,
             encoding_type: input.encoding_type,
             name: Some(input.bucket),
@@ -484,7 +505,7 @@ impl S3 for FileSystem {
         let object_path = self.get_object_path(&bucket, &key)?;
         let mut file_writer = self.prepare_file_write(&object_path).await?;
 
-        let mut md5_hash = <Md5 as Digest>::new();
+        let mut md5_hash = Md5::new();
         let stream = body.inspect_ok(|bytes| {
             md5_hash.update(bytes.as_ref());
             checksum.update(bytes.as_ref());
@@ -564,6 +585,13 @@ impl S3 for FileSystem {
             ..
         } = req.input;
 
+        if part_number > 10_000 {
+            return Err(s3_error!(
+                InvalidArgument,
+                "Part number must be an integer between 1 and 10000, inclusive"
+            ));
+        }
+
         let body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
         let upload_id = Uuid::parse_str(&upload_id).map_err(|_| s3_error!(InvalidRequest))?;
@@ -573,7 +601,7 @@ impl S3 for FileSystem {
 
         let file_path = self.resolve_upload_part_path(upload_id, part_number)?;
 
-        let mut md5_hash = <Md5 as Digest>::new();
+        let mut md5_hash = Md5::new();
         let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
 
         let mut file_writer = self.prepare_file_write(&file_path).await?;
@@ -637,7 +665,7 @@ impl S3 for FileSystem {
         let _ = try_!(src_file.seek(io::SeekFrom::Start(start)).await);
         let body = StreamingBlob::wrap(bytes_stream(ReaderStream::with_capacity(src_file, 4096), content_length_usize));
 
-        let mut md5_hash = <Md5 as Digest>::new();
+        let mut md5_hash = Md5::new();
         let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
 
         let mut file_writer = self.prepare_file_write(&dst_path).await?;
@@ -737,6 +765,12 @@ impl S3 for FileSystem {
         let mut file_writer = self.prepare_file_write(&object_path).await?;
 
         let mut cnt: i32 = 0;
+        let total_parts_cnt = multipart_upload
+            .parts
+            .as_ref()
+            .map(|parts| i32::try_from(parts.len()).expect("total number of parts must be <= 10000."))
+            .unwrap_or_default();
+
         for part in multipart_upload.parts.into_iter().flatten() {
             let part_number = part
                 .part_number
@@ -750,6 +784,10 @@ impl S3 for FileSystem {
 
             let mut reader = try_!(fs::File::open(&part_path).await);
             let size = try_!(tokio::io::copy(&mut reader, &mut file_writer.writer()).await);
+
+            if part_number != total_parts_cnt && size < 5 * 1024 * 1024 {
+                return Err(s3_error!(EntityTooSmall));
+            }
 
             debug!(from = %part_path.display(), tmp = %file_writer.tmp_path().display(), to = %file_writer.dest_path().display(), ?size, "write file");
             try_!(fs::remove_file(&part_path).await);
@@ -807,5 +845,81 @@ impl S3 for FileSystem {
         debug!(bucket = %bucket, key = %key, upload_id = %upload_id, "multipart upload aborted");
 
         Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
+    }
+}
+
+impl FileSystem {
+    async fn list_objects_with_delimiter(
+        &self,
+        bucket_root: &Path,
+        prefix: &str,
+        delimiter: &str,
+        objects: &mut Vec<Object>,
+        common_prefixes: &mut std::collections::BTreeSet<String>,
+    ) -> S3Result<()> {
+        // For delimiter-based listing, we need to recursively scan all files
+        // but group them according to the delimiter rules
+        let mut dir_queue: VecDeque<PathBuf> = default();
+        dir_queue.push_back(bucket_root.to_owned());
+        let prefix_is_empty = prefix.is_empty();
+
+        while let Some(dir) = dir_queue.pop_front() {
+            let mut iter = try_!(fs::read_dir(dir).await);
+
+            while let Some(entry) = try_!(iter.next_entry().await) {
+                let file_type = try_!(entry.file_type().await);
+                let entry_path = entry.path();
+
+                // Calculate the key relative to the bucket root
+                let key = try_!(entry_path.strip_prefix(bucket_root));
+                let Some(key_str) = normalize_path(key, "/") else {
+                    continue;
+                };
+
+                // Skip if doesn't match prefix
+                if !prefix_is_empty && !key_str.starts_with(prefix) {
+                    // For directories, also skip if they don't have potential to contain matching files
+                    if file_type.is_dir() && !prefix.starts_with(&key_str) && !key_str.starts_with(prefix) {
+                        continue;
+                    }
+                    if file_type.is_file() {
+                        continue;
+                    }
+                }
+
+                if file_type.is_dir() {
+                    // Continue scanning this directory
+                    dir_queue.push_back(entry_path);
+                } else {
+                    // For files, determine if they should be listed directly or as common prefixes
+                    let remaining = &key_str[prefix.len()..];
+
+                    if remaining.contains(delimiter) {
+                        // File is in a subdirectory, add the subdirectory as common prefix
+                        if let Some(delimiter_pos) = remaining.find(delimiter) {
+                            let mut next_prefix = String::with_capacity(prefix.len() + delimiter_pos + 1);
+                            next_prefix.push_str(prefix);
+                            next_prefix.push_str(&remaining[..=delimiter_pos]);
+                            common_prefixes.insert(next_prefix);
+                        }
+                    } else {
+                        // File is at the current level, include it in objects
+                        let metadata = try_!(entry.metadata().await);
+                        let last_modified = Timestamp::from(try_!(metadata.modified()));
+                        let size = metadata.len();
+
+                        let object = Object {
+                            key: Some(key_str),
+                            last_modified: Some(last_modified),
+                            size: Some(try_!(i64::try_from(size))),
+                            ..Default::default()
+                        };
+                        objects.push(object);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }

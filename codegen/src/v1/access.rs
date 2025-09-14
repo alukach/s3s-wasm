@@ -9,11 +9,13 @@ pub fn codegen(ops: &Operations) {
     declare_codegen!();
 
     g([
+        "#![allow(clippy::doc_markdown)]",
+        "",
         "use super::S3AccessContext;",
         "",
         "use crate::dto::*;",
         "use crate::error::S3Result;",
-        "use crate::request::S3Request;",
+        "use crate::protocol::S3Request;",
         "",
         "#[async_trait::async_trait]",
         "pub trait S3Access: Send + Sync + 'static {",

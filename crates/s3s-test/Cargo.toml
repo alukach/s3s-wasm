@@ -1,6 +1,6 @@
 [package]
 name = "s3s-test"
-version = "0.11.0"
+version = "0.12.0-dev"
 description = "s3s test suite"
 readme = "../../README.md"
 keywords = ["s3"]
@@ -8,21 +8,22 @@ categories = ["web-programming", "web-programming::http-server"]
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
-tokio = { version = "1.44.1", features = ["full"] }
+tokio = { version = "1.47.1", features = ["full"] }
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
-clap = { version = "4.5.34", features = ["derive"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }
+clap = { version = "4.5.47", features = ["derive"] }
 dotenvy = "0.15.7"
-serde_json = "1.0.140"
-indexmap = "2.8.0"
+serde_json = "1.0.143"
+indexmap = "2.11.1"
 colored = "3.0.0"
-regex = "1.11.1"
+regex = "1.11.2"
 nugine-rust-utils = "0.3.1"
-backtrace = "0.3.74"
-const-str = { version = "0.6.2", features = ["std", "proc"] }
+backtrace = "0.3.75"
+const-str = { version = "0.7.0", features = ["std", "proc"] }

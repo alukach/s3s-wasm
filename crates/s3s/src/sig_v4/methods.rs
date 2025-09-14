@@ -812,7 +812,7 @@ mod tests {
         use hyper::header::HeaderName;
         use hyper::header::HeaderValue;
 
-        let mut req = hyper::Request::<hyper::body::Bytes>::default();
+        let mut req = http::Request::<hyper::body::Bytes>::default();
 
         *req.method_mut() = Method::GET;
         *req.uri_mut() = hyper::Uri::from_static(
@@ -847,7 +847,7 @@ mod tests {
 
             let signed_headers = OrderedHeaders::from_headers(req.headers())
                 .unwrap()
-                .find_multiple(signed_header_names);
+                .find_multiple_with_on_missing(signed_header_names, |_| None);
 
             let canonical_request = create_canonical_request(req.method(), uri_path, query_strings, &signed_headers, payload);
 

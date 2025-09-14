@@ -1,6 +1,6 @@
 [package]
 name = "s3s-model"
-version = "0.11.0"
+version = "0.12.0-dev"
 description = "S3 Protocol Model"
 readme = "../../README.md"
 keywords = ["s3"]
@@ -8,12 +8,13 @@ categories = ["web-programming", "web-programming::http-server"]
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
-anyhow = "1.0.97"
+anyhow = "1.0.99"
 numeric_cast = "0.3.0"
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
+serde_json = "1.0.143"

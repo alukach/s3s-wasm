@@ -65,7 +65,7 @@ fn config() -> &'static SdkConfig {
         };
 
         // Convert to aws http client
-        let client = s3s_aws::Client::from(service.into_shared());
+        let client = s3s_aws::Client::from(service);
 
         // Setup aws sdk config
         SdkConfig::builder()
@@ -184,6 +184,129 @@ async fn test_list_objects_v2() -> Result<()> {
     assert!(!contents.is_empty());
     assert!(contents.contains(&key1));
     assert!(contents.contains(&key2));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_list_objects_v2_with_prefixes() -> Result<()> {
+    let c = Client::new(config());
+    let bucket = format!("test-list-prefixes-{}", Uuid::new_v4());
+    let bucket_str = bucket.as_str();
+    create_bucket(&c, bucket_str).await?;
+
+    // Create files in nested directory structure
+    let content = "hello world\n";
+    let files = [
+        "README.md",                   // Root level file
+        "test/subdirectory/README.md", // Nested file
+        "test/file.txt",               // File in test/ directory
+        "other/dir/file.txt",          // File in other/dir/ directory
+    ];
+
+    for key in &files {
+        c.put_object()
+            .bucket(bucket_str)
+            .key(*key)
+            .body(ByteStream::from_static(content.as_bytes()))
+            .send()
+            .await?;
+    }
+
+    // List without delimiter - should return all files recursively
+    let result = c.list_objects_v2().bucket(bucket_str).send().await;
+
+    let response = log_and_unwrap!(result);
+    let contents: Vec<_> = response.contents().iter().filter_map(|obj| obj.key()).collect();
+
+    debug!("List without delimiter - objects: {:?}", contents);
+    assert_eq!(contents.len(), 4);
+    for key in &files {
+        assert!(contents.contains(key), "Missing key: {key}");
+    }
+
+    // List with delimiter "/" - should return root files and common prefixes
+    let result = c.list_objects_v2().bucket(bucket_str).delimiter("/").send().await;
+
+    let response = log_and_unwrap!(result);
+
+    // Should have one file at root level
+    let contents: Vec<_> = response.contents().iter().filter_map(|obj| obj.key()).collect();
+    debug!("List with delimiter - objects: {:?}", contents);
+    assert_eq!(contents.len(), 1);
+    assert!(contents.contains(&"README.md"));
+
+    // Should have two common prefixes: "test/" and "other/"
+    let prefixes: Vec<_> = response.common_prefixes().iter().filter_map(|cp| cp.prefix()).collect();
+    debug!("List with delimiter - prefixes: {:?}", prefixes);
+    assert_eq!(prefixes.len(), 2);
+    assert!(prefixes.contains(&"test/"));
+    assert!(prefixes.contains(&"other/"));
+
+    // List with prefix "test/" and delimiter "/" - should return files in test/ and subdirectories
+    let result = c
+        .list_objects_v2()
+        .bucket(bucket_str)
+        .prefix("test/")
+        .delimiter("/")
+        .send()
+        .await;
+
+    let response = log_and_unwrap!(result);
+
+    // Should have one file in test/ directory
+    let contents: Vec<_> = response.contents().iter().filter_map(|obj| obj.key()).collect();
+    debug!("List with prefix test/ - objects: {:?}", contents);
+    assert_eq!(contents.len(), 1);
+    assert!(contents.contains(&"test/file.txt"));
+
+    // Should have one common prefix: "test/subdirectory/"
+    let prefixes: Vec<_> = response.common_prefixes().iter().filter_map(|cp| cp.prefix()).collect();
+    debug!("List with prefix test/ - prefixes: {:?}", prefixes);
+    assert_eq!(prefixes.len(), 1);
+    assert!(prefixes.contains(&"test/subdirectory/"));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_list_objects_v1_with_prefixes() -> Result<()> {
+    let c = Client::new(config());
+    let bucket = format!("test-list-v1-prefixes-{}", Uuid::new_v4());
+    let bucket_str = bucket.as_str();
+    create_bucket(&c, bucket_str).await?;
+
+    // Create a simple structure
+    let content = "hello world\n";
+    let files = ["README.md", "dir/file.txt"];
+
+    for key in &files {
+        c.put_object()
+            .bucket(bucket_str)
+            .key(*key)
+            .body(ByteStream::from_static(content.as_bytes()))
+            .send()
+            .await?;
+    }
+
+    // Test list_objects (v1) with delimiter
+    let result = c.list_objects().bucket(bucket_str).delimiter("/").send().await;
+
+    let response = log_and_unwrap!(result);
+
+    // Should have one file at root level
+    let contents: Vec<_> = response.contents().iter().filter_map(|obj| obj.key()).collect();
+    debug!("ListObjects v1 with delimiter - objects: {:?}", contents);
+    assert_eq!(contents.len(), 1);
+    assert!(contents.contains(&"README.md"));
+
+    // Should have one common prefix: "dir/"
+    let prefixes: Vec<_> = response.common_prefixes().iter().filter_map(|cp| cp.prefix()).collect();
+    debug!("ListObjects v1 with delimiter - prefixes: {:?}", prefixes);
+    assert_eq!(prefixes.len(), 1);
+    assert!(prefixes.contains(&"dir/"));
 
     Ok(())
 }
@@ -392,6 +515,79 @@ async fn test_upload_part_copy() -> Result<()> {
         delete_bucket(&c, bucket).await?;
         delete_object(&c, src_bucket, src_key).await?;
         delete_bucket(&c, src_bucket).await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[tracing::instrument]
+async fn test_single_object_get_range() -> Result<()> {
+    let _guard = serial().await;
+
+    let c = Client::new(config());
+    let bucket = format!("test-single-object-{}", Uuid::new_v4());
+    let bucket = bucket.as_str();
+    let key = "sample.txt";
+    let content = "hello world\n你好世界\n";
+    let crc32c = base64_simd::STANDARD.encode_to_string(crc32c::crc32c(content.as_bytes()).to_be_bytes());
+
+    create_bucket(&c, bucket).await?;
+
+    {
+        let body = ByteStream::from_static(content.as_bytes());
+        c.put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(body)
+            .checksum_crc32_c(crc32c.as_str())
+            .send()
+            .await?;
+    }
+
+    {
+        let ans = c
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range("bytes=0-4")
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await?;
+
+        // S3 doesn't return checksums when a range is specified
+        assert!(&ans.checksum_crc32().is_none());
+        assert!(&ans.checksum_crc32_c().is_none());
+
+        let content_length: usize = ans.content_length().unwrap().try_into().unwrap();
+        let body = ans.body.collect().await?.into_bytes();
+
+        assert_eq!(content_length, 5);
+        assert_eq!(body.as_ref(), &content.as_bytes()[0..=4]);
+    }
+
+    {
+        let ans = c
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range("bytes=0-1000")
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await?;
+
+        let content_length: usize = ans.content_length().unwrap().try_into().unwrap();
+        let checksum_crc32c = ans.checksum_crc32_c.unwrap();
+        let body = ans.body.collect().await?.into_bytes();
+
+        assert_eq!(content_length, content.len());
+        assert_eq!(checksum_crc32c, crc32c);
+        assert_eq!(body.as_ref(), content.as_bytes());
+    }
+
+    {
+        delete_object(&c, bucket, key).await?;
+        delete_bucket(&c, bucket).await?;
     }
 
     Ok(())
